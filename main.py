@@ -198,16 +198,46 @@ def fill_contract(filename, data_dict):
         return None
     with open(path, 'rb') as f:
         raw = f.read()
+
     zin = zipfile.ZipFile(io.BytesIO(raw))
     doc_xml = zin.read('word/document.xml').decode('utf-8')
+
+    # 策略：提取所有 w:t 文字組合後替換，處理跨 run 的佔位符
+    wt_pattern = r'(<w:t[^>]*>)(.*?)(</w:t>)'
+    combined = ''
+    positions = []
+    for m in re.finditer(wt_pattern, doc_xml, re.DOTALL):
+        text = m.group(2)
+        start_in_xml = m.start(2)
+        combined += text
+        for i in range(len(text)):
+            positions.append(start_in_xml + i)
+
+    result = doc_xml
+    offset = 0
     for name, value in data_dict.items():
-        if value:
-            doc_xml = replace_ph(doc_xml, name, str(value))
+        if not value:
+            continue
+        target = '{{' + name + '}}'
+        idx = combined.find(target)
+        if idx < 0:
+            continue
+        safe = str(value).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+        xml_start = positions[idx]
+        xml_end = positions[idx + len(target) - 1] + 1
+        result = result[:xml_start + offset] + safe + result[xml_end + offset:]
+        offset_diff = len(safe) - len(target)
+        offset += offset_diff
+        new_combined = combined[:idx] + value + combined[idx+len(target):]
+        new_positions = positions[:idx] + [positions[idx]] * len(value) + positions[idx+len(target):]
+        combined = new_combined
+        positions = new_positions
+
     out = io.BytesIO()
     with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as zout:
         for item in zin.infolist():
             if item.filename == 'word/document.xml':
-                zout.writestr(item, doc_xml.encode('utf-8'))
+                zout.writestr(item, result.encode('utf-8'))
             else:
                 zout.writestr(item, zin.read(item.filename))
     zin.close()
