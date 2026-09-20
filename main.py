@@ -126,71 +126,42 @@ class GenerateRequest(BaseModel):
     data: ContractData
 
 def fill_contract(filename, data_dict):
-    """填入合約佔位符，直接操作 ZIP/XML，不依賴外部腳本"""
     if not os.path.exists(filename):
         return None
     try:
         with open(filename, "rb") as f:
             raw = f.read()
-
         zin = zipfile.ZipFile(io.BytesIO(raw))
         doc_xml = zin.read("word/document.xml").decode("utf-8")
 
         def safe(v):
             return str(v).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
 
-        # 步驟1：替換 MERGEFIELD 欄位
-        def replace_mergefield(x, name, value):
-            pat = (
-                r'<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*'
-                r'<w:fldChar[^>]*w:fldCharType=["\']begin["\'][^/]*/>\s*</w:r>'
-                r'.*?MERGEFIELD\s+' + re.escape(name) + r'[\s\\]*.*?'
-                r'<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*'
-                r'<w:fldChar[^>]*w:fldCharType=["\']end["\'][^/]*/>\s*</w:r>'
-            )
-            repl = f'<w:r><w:t xml:space="preserve">{safe(value)}</w:t></w:r>'
-            return re.sub(pat, repl, x, flags=re.DOTALL)
+        wt_re = re.compile(r'(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)', re.DOTALL)
 
-        # 步驟2：替換跨 run 的 {{ }} — 合併所有 w:t 文字後替換
-        def replace_split(x, replacements):
-            wt_re = re.compile(r'(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)', re.DOTALL)
-            result = x
-            for name, value in replacements.items():
-                if not value:
-                    continue
-                target = "{{" + name + "}}"
-                sv = safe(value)
-                # 先試直接替換（佔位符在單一 w:t 內）
-                if target in result:
-                    result = result.replace(target, sv)
-                    continue
-                # 再試跨 run 替換
-                entries = [(m.start(2), m.end(2), m.group(2)) for m in wt_re.finditer(result)]
-                full = "".join(e[2] for e in entries)
-                idx = full.find(target)
-                if idx < 0:
-                    continue
-                char_pos = 0
-                r_start = r_end = None
-                for xs, xe, txt in entries:
-                    end_pos = char_pos + len(txt)
-                    if r_start is None and end_pos > idx:
-                        r_start = xs + (idx - char_pos)
-                    if r_start is not None and end_pos >= idx + len(target):
-                        r_end = xs + (idx + len(target) - char_pos)
-                        break
-                    char_pos = end_pos
-                if r_start is not None and r_end is not None:
-                    result = result[:r_start] + sv + result[r_end:]
-            return result
-
-        # 先處理 MERGEFIELD，再處理 {{ }}
         for name, value in data_dict.items():
-            if value:
-                doc_xml = replace_mergefield(doc_xml, name, value)
-        doc_xml = replace_split(doc_xml, data_dict)
+            if not value:
+                continue
+            target = "{{" + name + "}}"
+            sv = safe(value)
+            entries = [(m.start(2), m.end(2), m.group(2)) for m in wt_re.finditer(doc_xml)]
+            full = "".join(e[2] for e in entries)
+            idx = full.find(target)
+            if idx < 0:
+                continue
+            char_pos = 0
+            r_start = r_end = None
+            for xs, xe, txt in entries:
+                end_pos = char_pos + len(txt)
+                if r_start is None and end_pos > idx:
+                    r_start = xs + (idx - char_pos)
+                if r_start is not None and end_pos >= idx + len(target):
+                    r_end = xs + (idx + len(target) - char_pos)
+                    break
+                char_pos = end_pos
+            if r_start is not None and r_end is not None:
+                doc_xml = doc_xml[:r_start] + sv + doc_xml[r_end:]
 
-        # 重新打包
         out = io.BytesIO()
         with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
             for item in zin.infolist():
@@ -202,8 +173,9 @@ def fill_contract(filename, data_dict):
         out.seek(0)
         return out
     except Exception as e:
-        print(f"fill_contract error: {e}")
+        print(f"fill_contract error [{filename}]: {e}")
         return None
+
 
 @app.get("/")
 def root():
