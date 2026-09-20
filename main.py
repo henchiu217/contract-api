@@ -125,50 +125,54 @@ class GenerateRequest(BaseModel):
     contracts: list
     data: ContractData
 
-UNPACK_SCRIPT = "/mnt/skills/public/docx/scripts/office/unpack.py"
-PACK_SCRIPT   = "/mnt/skills/public/docx/scripts/office/pack.py"
-
 def fill_contract(filename, data_dict):
+    """填入合約佔位符，直接操作 ZIP/XML，不依賴外部腳本"""
     if not os.path.exists(filename):
         return None
-    tmp = tempfile.mkdtemp()
     try:
-        # 用 unpack.py 合併被切割的 runs
-        subprocess.run(["python3", UNPACK_SCRIPT, filename, tmp], capture_output=True)
-        xml_path = os.path.join(tmp, "word", "document.xml")
-        if not os.path.exists(xml_path):
-            return None
-        with open(xml_path, "r", encoding="utf-8") as f:
-            xml = f.read()
+        with open(filename, "rb") as f:
+            raw = f.read()
 
-        # 替換 MERGEFIELD 結構
+        zin = zipfile.ZipFile(io.BytesIO(raw))
+        doc_xml = zin.read("word/document.xml").decode("utf-8")
+
+        def safe(v):
+            return str(v).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+
+        # 步驟1：替換 MERGEFIELD 欄位
         def replace_mergefield(x, name, value):
-            safe = str(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
             pat = (
-                r'<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*<w:fldChar[^>]*w:fldCharType=["\']begin["\'][^/]*/>\s*</w:r>'
-                r'.*?MERGEFIELD\s+' + re.escape(name) + r'\s*.*?'
-                r'<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*<w:fldChar[^>]*w:fldCharType=["\']end["\'][^/]*/>\s*</w:r>'
+                r'<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*'
+                r'<w:fldChar[^>]*w:fldCharType=["\']begin["\'][^/]*/>\s*</w:r>'
+                r'.*?MERGEFIELD\s+' + re.escape(name) + r'[\s\\]*.*?'
+                r'<w:r[^>]*>(?:<w:rPr>.*?</w:rPr>)?\s*'
+                r'<w:fldChar[^>]*w:fldCharType=["\']end["\'][^/]*/>\s*</w:r>'
             )
-            return re.sub(pat, f'<w:r><w:t xml:space="preserve">{safe}</w:t></w:r>', x, flags=re.DOTALL)
+            repl = f'<w:r><w:t xml:space="preserve">{safe(value)}</w:t></w:r>'
+            return re.sub(pat, repl, x, flags=re.DOTALL)
 
-        # 替換跨 run 的 {{ }} 佔位符
+        # 步驟2：替換跨 run 的 {{ }} — 合併所有 w:t 文字後替換
         def replace_split(x, replacements):
             wt_re = re.compile(r'(<w:t(?:\s[^>]*)?>)(.*?)(</w:t>)', re.DOTALL)
-            entries = [(m.start(2), m.end(2), m.group(2)) for m in wt_re.finditer(x)]
             result = x
             for name, value in replacements.items():
                 if not value:
                     continue
                 target = "{{" + name + "}}"
-                safe = str(value).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
-                entries2 = [(m.start(2), m.end(2), m.group(2)) for m in wt_re.finditer(result)]
-                full2 = "".join(e[2] for e in entries2)
-                idx = full2.find(target)
+                sv = safe(value)
+                # 先試直接替換（佔位符在單一 w:t 內）
+                if target in result:
+                    result = result.replace(target, sv)
+                    continue
+                # 再試跨 run 替換
+                entries = [(m.start(2), m.end(2), m.group(2)) for m in wt_re.finditer(result)]
+                full = "".join(e[2] for e in entries)
+                idx = full.find(target)
                 if idx < 0:
                     continue
                 char_pos = 0
                 r_start = r_end = None
-                for xs, xe, txt in entries2:
+                for xs, xe, txt in entries:
                     end_pos = char_pos + len(txt)
                     if r_start is None and end_pos > idx:
                         r_start = xs + (idx - char_pos)
@@ -177,26 +181,29 @@ def fill_contract(filename, data_dict):
                         break
                     char_pos = end_pos
                 if r_start is not None and r_end is not None:
-                    result = result[:r_start] + safe + result[r_end:]
+                    result = result[:r_start] + sv + result[r_end:]
             return result
 
-        # 先 MERGEFIELD，再 {{ }}
+        # 先處理 MERGEFIELD，再處理 {{ }}
         for name, value in data_dict.items():
             if value:
-                xml = replace_mergefield(xml, name, value)
-        xml = replace_split(xml, data_dict)
+                doc_xml = replace_mergefield(doc_xml, name, value)
+        doc_xml = replace_split(doc_xml, data_dict)
 
-        with open(xml_path, "w", encoding="utf-8") as f:
-            f.write(xml)
-
-        out_path = os.path.join(tmp, "output.docx")
-        subprocess.run(["python3", PACK_SCRIPT, tmp, out_path], capture_output=True)
-        if not os.path.exists(out_path):
-            return None
-        with open(out_path, "rb") as f:
-            return io.BytesIO(f.read())
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        # 重新打包
+        out = io.BytesIO()
+        with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+            for item in zin.infolist():
+                if item.filename == "word/document.xml":
+                    zout.writestr(item, doc_xml.encode("utf-8"))
+                else:
+                    zout.writestr(item, zin.read(item.filename))
+        zin.close()
+        out.seek(0)
+        return out
+    except Exception as e:
+        print(f"fill_contract error: {e}")
+        return None
 
 @app.get("/")
 def root():
